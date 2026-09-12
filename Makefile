@@ -71,8 +71,23 @@ fmt: ## Ruff format and autofix
 typecheck: ## Mypy (strict)
 	$(PY) -m mypy src
 
+.PHONY: trace
+trace: ## Check every spec requirement names a test that exists
+	$(PY) tools/trace.py
+
+.PHONY: spec
+spec: ## Scaffold a new spec: make spec NAME=my-feature
+	@test -n "$(NAME)" || { echo "usage: make spec NAME=my-feature"; exit 1; }
+	@n=$$(printf '%04d' $$(( $$(ls -d docs/specs/[0-9]* 2>/dev/null | wc -l) + 1 ))); \
+	dir="docs/specs/$$n-$(NAME)"; \
+	test ! -d "$$dir" || { echo "$$dir already exists"; exit 1; }; \
+	mkdir -p "$$dir"; \
+	cp docs/specs/templates/spec.md "$$dir/spec.md"; \
+	echo "Wrote $$dir/spec.md — fill it in, then 'make trace'."; \
+	echo "Add plan.md and tasks.md from docs/specs/templates/ before implementing."
+
 .PHONY: check
-check: lint typecheck test ## Lint + typecheck + test
+check: lint typecheck test trace ## Lint + typecheck + test + spec traceability
 
 .PHONY: openapi
 openapi: ## Write the OpenAPI document to docs/openapi.json

@@ -4,15 +4,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-`make help` lists every target. Two that are directives rather than conveniences: run
-`make check` (ruff + mypy --strict + pytest) before calling work done, and `make openapi`
-after any route or schema change.
+`make help` lists every target. Three are directives rather than conveniences:
+
+- **`make dev` first on a fresh checkout.** `make install` installs the package alone; ruff,
+  mypy, pytest and respx arrive only with `make dev` (`-e ".[all,dev]"`).
+- **`make check`** (ruff + mypy --strict + pytest) before calling work done.
+- **`make openapi`** after any route or schema change — `docs/openapi.json` is generated and
+  committed, never hand-edited.
+- **`make trace`** (part of `make check`) enforces that every spec requirement names a test
+  that exists. `make spec NAME=<slug>` scaffolds a new one.
 
 Single test: `.venv/bin/pytest tests/unit/test_turns.py::test_name -q` (`pythonpath=["src"]`
 and `asyncio_mode=auto` come from `pyproject.toml`, so no env setup is needed).
 
 The tests are hermetic — no service needs to be running. `make run` needs nothing either;
 the service boots and serves `/v1/health` with every downstream down.
+
+`make fmt` both formats and autofixes (`ruff format`, then `ruff check --fix`); `make cov`
+adds a term-missing coverage report.
+
+To drive it by hand, `make env` writes a gitignored `.env` from the committed `.env.example`,
+seeding one development key per channel — `airo_local_customer_key` for `POST /v1/chat`,
+`airo_local_business_key` for `POST /v1/query`. Both are bound to the development
+`hash_salt` and grant no `allow_actions`. `make up` runs the container instead, but it joins
+`air-net`, which **air-infra owns and must already be up**; `make run` on the host is the path
+that needs nothing from Docker.
 
 ## Naming
 
@@ -38,6 +54,11 @@ Request path: `main.create_app` → `api/middleware.py` (raw ASGI, not `BaseHTTP
 because responses are long-lived streams) → `api/deps.require_principal` → `api/v1/*` →
 `engine/turn.TurnEngine.run` → an `AsyncIterator[Event]` that is either SSE-framed
 (`api/sse.py`) or folded into one `TurnResult` (`engine.turn.collect`).
+
+The whole `/v1` surface is seven routes: `POST /v1/chat`, `POST /v1/query`,
+`GET`/`DELETE /v1/sessions/{session_id}`, and `GET /v1/health`, `/v1/ready`,
+`/v1/capabilities`. Streaming is content-negotiated on `Accept: text/event-stream`; the same
+engine serves both shapes.
 
 Four invariants shape most of the code. Breaking any of them is a design change, not a
 refactor:
@@ -74,6 +95,30 @@ and per-session cost ceilings, a turn deadline decremented before the synthesis 
 `CACHE` (Phase 5), `CLASSIFY`/`GATHER` (Phase 3). Routing is still the literal `/propose`
 trigger — a stand-in must not appear to understand intent it does not.
 
+### Wiring (`main.py` + `api/deps.py`)
+
+Nothing is a module-level singleton. `create_app` assembles one frozen `AppState` dataclass —
+settings, `ApiKeyStore`, `InfraClient`, `LlmClient`, the session store — and hangs it on
+`app.state.air_state` (`deps.STATE_ATTR`). Routes reach it via `Depends(get_app_state)` and
+take settings from `get_settings_dep`, never the `get_settings()` process singleton. It is a
+dataclass rather than loose `app.state` attributes so a misspelled field fails at import
+instead of at request time, and it is what lets a test swap a single collaborator
+(`state.llm.chat`, `state.infra.probe`) on an otherwise entirely real app.
+
+### Guardrails
+
+Five independent pure-function modules — `injection`, `scope`, `pii`, `boundary`, `escalation`
+— called directly by the engine rather than through a plugin framework. Strictness is per
+channel, from `GuardrailSettings.customer` / `.business`, which is what invariant 1 protects.
+`boundary.delimit` demarcates anything that did not originate in this service's own code
+before it reaches a prompt, and the prompt version used is logged with the turn.
+
+### Prompts
+
+`prompts/registry.py` holds prompts in Python as `route → version → Prompt`, selected by
+`PromptSettings.pins` and otherwise by the newest version. `"latest"` is a real version, not
+an alias: a prompt change stays reviewable and revertible like code.
+
 ### Contracts that are public surface
 
 - **`constants.py`** — `Stage`, `Route`, `Channel`, `EventType`, `TurnStatus`, scopes. These
@@ -91,12 +136,13 @@ trigger — a stand-in must not appear to understand intent it does not.
 ### Configuration
 
 `config.py` is nested pydantic-settings with prefix `AIR_ORCHESTRATOR_SERVICE__` and `__` as
-delimiter. `create_app(settings)` takes settings as an argument and never reads the
-environment itself — tests assemble a full app with bespoke settings rather than mutating the
-environment or clearing `get_settings`' cache. Budgets and guardrail profiles live in settings
-so tuning cost/latency never requires a deploy. Every optional downstream defaults to
-`enabled=false`: a fresh checkout must not report itself degraded against services that do not
-exist.
+delimiter; the sections are `app`, `infra`, `llm`, `downstream`, `turn`, `guardrails`,
+`session`, `cache`, `prompts`, `security`, `obs`. `create_app(settings)` takes settings as an
+argument and never reads the environment itself — tests assemble a full app with bespoke
+settings rather than mutating the environment or clearing `get_settings`' cache. Budgets and
+guardrail profiles live in settings so tuning cost/latency never requires a deploy. Every
+optional downstream defaults to `enabled=false`: a fresh checkout must not report itself
+degraded against services that do not exist.
 
 ## Conventions
 
@@ -111,13 +157,36 @@ exist.
 - **Tests never depend on the ambient machine.** `tests/conftest.py` stubs the air-infra and
   air-llm probes in *both* directions (`reachable_*` / `unreachable_*`) and points their base
   URLs at `.invalid` hosts so an escaping probe fails loudly. The `app` fixture patches
-  `LlmClient.chat` with a canned response; a test wanting the failure path reassigns it.
+  `LlmClient.chat` with a canned response; a test wanting the failure path reassigns it. The
+  `client` fixture is in-process (`ASGITransport`, no socket) and deliberately does **not**
+  drive the lifespan.
 - Nothing renders a raw API key or digest into a log line, repr, or exception message.
+
+## Docs and specs
+
+`docs/00-plan.md` (problem, decisions, phasing) → `docs/01-hld.md` (design; §9 tracks the
+cross-repo gaps) → `docs/02-lld.md` (the implementation contract; §15 is the authoritative
+build status, and §1's layout marks unbuilt modules with **○**). `docs/openapi.json` is
+generated by `make openapi`.
+
+**`docs/specs/` is the normative layer** and this repo is spec-driven: behaviour is specified
+before it is built, and every requirement names the test that proves it.
+
+- `docs/specs/constitution.md` — the invariants every spec is checked against. The four
+  architectural invariants above are Articles I–IV. Amend it, don't edit it.
+- `docs/specs/NNNN-slug/{spec,plan,tasks}.md` — numbered, never renumbered. Requirement ids
+  (`REQ-MUT-004`) are permanent addresses: cite them in commits, tests and PRs.
+- `docs/specs/README.md` — the workflow, and how the spec layer relates to 00/01/02.
+
+Where a spec and a design doc disagree about **behaviour**, the spec wins; about **rationale**,
+the design doc wins. Slash commands `/specify`, `/plan`, `/tasks` and `/trace` drive the loop.
+
+**Changing behaviour means changing its spec first.** A spec edited afterwards to match code
+already written is just a changelog, and `make trace` cannot tell the difference — you can.
 
 ## Where to start on the next phase
 
-`docs/02-lld.md` §15 is the authoritative build status, and §1's layout marks unbuilt modules
-with **○**. The near-term work, in order:
+The near-term work, in order:
 
 - **Phase 2b — durable sessions.** Redis behind the existing `SessionStore` protocol in
   `memory/session.py`. The key shape is already tenant-namespaced, so this is a backend swap;
